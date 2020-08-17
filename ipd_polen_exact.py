@@ -168,6 +168,7 @@ class Polen():
                 # self.policy_update_pg()
 
             # 1b. Train the PEN
+            # TODO: Convert this to a parallel version so one call to PEN is required
             for _ in range(self.args.n_pen):
                 # randomly generate z1, z2. Maybe generation centered on z0, z1 would be better.
                 z1 = torch.randn(self.args.embedding_size)
@@ -176,9 +177,9 @@ class Polen():
                 hist1, hist2 = self.rollout_binning(self.args.len_rollout, z1, z2)
 
                 # Compute the KL Div
-                w1, w2 = self.pen.forward(self.agent1.z, self.agent2.z)
-                w1 = softmax(w0)
-                w2 = softmax(w1)
+                w1, w2 = self.pen.forward(self.agent1.z.unsqueeze(0), self.agent2.z.unsqueeze(0))
+                w1 = F.softmax(w1.squeeze(), dim=0)
+                w2 = F.softmax(w2.squeeze(), dim=0)
                 # F.kl_div(Q.log(), P, None, None, 'sum')
                 self.pen_optimizer.zero_grad()
                 pen_loss = (hist1* (hist1 / w1).log()).sum() + (hist2* (hist2 / w2).log()).sum()
@@ -222,8 +223,10 @@ class Polen():
         Do Lola Updates
         """
         # copy other's parameters:
-        z1_ = torch.tensor(self.agent1.z.detach(), requires_grad=True)
-        z2_ = torch.tensor(self.agent2.z.detach(), requires_grad=True)
+        z1_ = self.agent1.z.clone().detach().requires_grad_(True)
+        z2_ = self.agent2.z.clone().detach().requires_grad_(True)
+        # z1_ = torch.tensor(self.agent1.z.detach(), requires_grad=True)
+        # z2_ = torch.tensor(self.agent2.z.detach(), requires_grad=True)
 
         for k in range(self.args.lookaheads):
             # estimate other's gradients from in_lookahead:
