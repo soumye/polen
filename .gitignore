@@ -1,3 +1,5 @@
 envs/__pycache__/*
-.vscode
+__pycache__/*
 imgs/*
+logdir/*
+.vscode

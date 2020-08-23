@@ -1,6 +1,7 @@
 # coding: utf-8
 
 import numpy as np
+import matplotlib.pyplot as plt
 import argparse
 import torch
 import os
@@ -14,18 +15,19 @@ from envs import IPD
 from tensorboardX import SummaryWriter
 
 from models import PolicyEvaluationNetwork, SteerablePolicy
-from plotting import plot
+from plotting import plot, plot_many
 
 def get_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('-lr_out', default=0.2, type=float, help='')
-    parser.add_argument('-lr_in', default=0.3, type=float, help='')
+    parser.add_argument('-lr_out', default=0.2, type=float, help='lr for outer loops')
+    parser.add_argument('-lr_in', default=0.3, type=float, help='lr for inner loops')
+    parser.add_argument('-lr_v', default= 0.1, type=float, help='lr for vf for baseline')
     parser.add_argument('-lr_pen', default=0.3, type=float, help='Adam lr for PEN')
     parser.add_argument('-gamma', default=0.96, type=float, help='')
-    parser.add_argument('-n_iter', default=50, type=int, help='No of algo iteration')
-    parser.add_argument('-len_rollout', default=200, type=int, help='Length of rollouts')
-    parser.add_argument('-batch_size', default=64, type=int, help='')
-    parser.add_argument('-seed', default=42, type=int, help='Random Seed')
+    parser.add_argument('-n_iter', default=200, type=int, help='No of algo iteration')
+    parser.add_argument('-len_rollout', default=150, type=int, help='Length of rollouts')
+    parser.add_argument('-batch_size', default=128, type=int, help='')
+    parser.add_argument('-seed', default=4, type=int, help='Random Seed')
     parser.add_argument('-lookaheads', default=1, type=int, help='No of lola lookaheads')
     parser.add_argument('-embedding_size', default=5, type=int, help='Size of the embedding z')
     parser.add_argument('-nbins', default=15, type=int, help='No of bins to discretize return space')
@@ -35,24 +37,66 @@ def get_args():
     parser.add_argument('-n_pen', default=10, type=int, help='')
     parser.add_argument('-nsamples_bin', default=30, type=int, help='No of rollouts for given z1/z2 to compute histogram of returns. Usually 2*nbins')
     parser.add_argument('-plot', action='store_true', help='Enable Plotting')
+    parser.add_argument('-use_baseline', default=True, action='store_true', help='Enable Baseline in Dice')
 
     return parser.parse_args()
 
-def phi(x1,x2):
-    return [x1*x2, x1*(1-x2), (1-x1)*x2,(1-x1)*(1-x2)]
+def magic_box(x):
+    return torch.exp(x - x.detach())
 
-def true_objective(theta1, theta2, ipd):
-    p1 = torch.sigmoid(theta1)
-    p2 = torch.sigmoid(theta2[[0,1,3,2,4]])
-    p0 = (p1[0], p2[0])
-    p = (p1[1:], p2[1:])
-    # create initial laws, transition matrix and rewards:
-    P0 = torch.stack(phi(*p0), dim=0).view(1,-1)
-    P = torch.stack(phi(*p), dim=1)
-    R = torch.from_numpy(ipd.payout_mat).view(-1,1).float()
-    # the true value to optimize:
-    objective = (P0.mm(torch.inverse(torch.eye(4) - args.gamma*P))).mm(R)
-    return -objective
+class Memory():
+    def __init__(self, args):
+        self.self_logprobs = []
+        self.other_logprobs = []
+        self.values = []
+        self.rewards = []
+        self.args = args
+
+    def add(self, lp, other_lp, v, r):
+        self.self_logprobs.append(lp)
+        self.other_logprobs.append(other_lp)
+        self.values.append(v)
+        self.rewards.append(r)
+
+    def dice_objective(self, only_self=False):
+        # bsz x traj_len
+        self_logprobs = torch.stack(self.self_logprobs, dim=1)
+        other_logprobs = torch.stack(self.other_logprobs, dim=1)
+        values = torch.stack(self.values, dim=1)
+        rewards = torch.stack(self.rewards, dim=1)
+
+        # apply discount:
+        cum_discount = torch.cumprod(self.args.gamma * torch.ones(*rewards.size()), dim=1)/self.args.gamma
+        discounted_rewards = rewards * cum_discount
+        discounted_values = values * cum_discount
+
+        # stochastics nodes involved in rewards dependencies:
+        if only_self:
+            dependencies = torch.cumsum(self_logprobs, dim=1)
+            # logprob of each stochastic nodes:
+            stochastic_nodes = self_logprobs
+        else:
+            dependencies = torch.cumsum(self_logprobs + other_logprobs, dim=1)
+            # logprob of each stochastic nodes:
+            stochastic_nodes = self_logprobs + other_logprobs
+
+        # logprob of each stochastic nodes:
+        stochastic_nodes = self_logprobs + other_logprobs
+
+        # dice objective:
+        dice_objective = torch.mean(torch.sum(magic_box(dependencies) * discounted_rewards, dim=1))
+
+        if self.args.use_baseline:
+            # variance_reduction:
+            baseline_term = torch.mean(torch.sum((1 - magic_box(stochastic_nodes)) * discounted_values, dim=1))
+            dice_objective = dice_objective + baseline_term
+
+        return -dice_objective # want to minimize -objective
+
+    def value_loss(self):
+        values = torch.stack(self.values, dim=1)
+        rewards = torch.stack(self.rewards, dim=1)
+        return torch.mean((rewards - values)**2)
 
 def get_gradient(objective, z):
     # create differentiable gradient for 2nd orders:
@@ -60,26 +104,54 @@ def get_gradient(objective, z):
     return grad_objective
 
 class Agent():
-    def __init__(self, args,  z=None):
-        # init z and its optimizer. z is the embedding
-        # TODO: How to initialize z. 0 is bad
-        self.z = nn.Parameter(torch.zeros(args.embedding_size, requires_grad=True))
-        # self.z = nn.Parameter(torch.randn(args.embedding_size, requires_grad=True))
-        self.z_optimizer = torch.optim.Adam(params=(self.z,),lr=args.lr_out)
+    def __init__(self, args):
+        # init z and its optimizer
+        self.args = args
+        self.z = nn.Parameter(torch.zeros(self.args.embedding_size, requires_grad=True))
+        self.z_optimizer = torch.optim.Adam((self.z,),lr=self.args.lr_out)
+        # init values and its optimizer
+        self.values = nn.Parameter(torch.zeros(self.args.embedding_size, requires_grad=True))
+        self.value_optimizer = torch.optim.Adam((self.values,),lr=self.args.lr_v)
 
     def z_update(self, objective):
         self.z_optimizer.zero_grad()
         objective.backward(retain_graph=True)
         self.z_optimizer.step()
 
-    def in_lookahead(self, theta, other_z):
-        other_objective = true_objective(theta + other_z, theta + self.z, ipd)
+    def value_update(self, loss):
+        self.value_optimizer.zero_grad()
+        loss.backward()
+        self.value_optimizer.step()
+
+    def in_lookahead(self, other_z, other_values, policy):
+        (s1, s2), _ = ipd.reset()
+        other_memory = Memory(self.args)
+        for t in range(self.args.len_rollout):
+            a1, lp1, v1 = policy.act(s1, self.z, self.values)
+            a2, lp2, v2 = policy.act(s2, other_z, other_values)
+            (s1, s2), (r1, r2),_,_ = ipd.step((a1, a2))
+            other_memory.add(lp2, lp1, v2, torch.from_numpy(r2).float())
+
+        other_objective = other_memory.dice_objective()
         grad = get_gradient(other_objective, other_z)
         return grad
 
-    def out_lookahead(self, theta, other_z):
-        objective = true_objective(theta + self.z, theta + other_z, ipd)
+    def out_lookahead(self, other_z, other_values, policy):
+        (s1, s2), _ = ipd.reset()
+        memory = Memory(self.args)
+        for t in range(self.args.len_rollout):
+            a1, lp1, v1 = policy.act(s1, self.z, self.values)
+            a2, lp2, v2 = policy.act(s2, other_z, other_values)
+            (s1, s2), (r1, r2),_,_ = ipd.step((a1, a2))
+            memory.add(lp1, lp2, v1, torch.from_numpy(r1).float())
+
+        # update self z
+        objective = memory.dice_objective()
         self.z_update(objective)
+        # update self value:
+        v_loss = memory.value_loss()
+        self.value_update(v_loss)
+
 
 class Polen():
     def __init__(self, args):
@@ -104,8 +176,8 @@ class Polen():
         score1 = 0
         score2 = 0
         for t in range(nsteps):
-            a1, lp1 = self.policy.act(s1, self.agent1.z)
-            a2, lp2 = self.policy.act(s2, self.agent2.z)
+            a1, lp1, v1 = self.policy.act(s1, self.agent1.z, self.agent1.values)
+            a2, lp2, v2 = self.policy.act(s2, self.agent2.z, self.agent2.values)
             (s1, s2), (r1, r2),_,_ = ipd.step((a1, a2))
             # cumulate scores
             score1 += np.mean(r1)/float(self.args.len_rollout)
@@ -138,8 +210,8 @@ class Polen():
             # 1a. For fixed z1 & z2, Learn steerable policy theta & PEN by maximizing rollouts
             for t in range(self.args.n_policy):
                 # Update steerable policy parameters. True possible for IPD
-                policy_loss = self.policy_update_true()
-                # self.policy_update_pg()
+                # policy_loss = self.policy_update_true()
+                policy_loss = self.policy_update_pg()
                 self.writer.add_scalar('PolicyObjective V1 plus V2', -policy_loss, update*self.args.n_policy + t )
 
             # 1b. Train the PEN
@@ -164,7 +236,7 @@ class Polen():
                 self.writer.add_scalar('PEN Loss: KL1 plus KL2', pen_loss, update*self.args.n_pen + t )
         
             # 2. Do on Lola Updates
-            self.lola_update_exact()
+            self.lola_update_dice()
             
             # evaluate:
             score = self.rollout(self.args.len_rollout)
@@ -174,50 +246,61 @@ class Polen():
 
             # Logging
             if update%10==0 :
-                print('After update', update, '------------')
                 p0 = [p.item() for p in torch.sigmoid(self.policy.theta)]
                 p1 = [p.item() for p in torch.sigmoid(self.policy.theta + self.agent1.z)]
                 p2 = [p.item() for p in torch.sigmoid(self.policy.theta + self.agent2.z)]
+                
+                print('After update', update, '------------')
                 print('score (%.3f,%.3f)\n' % (score[0], score[1]) , 'Default = {S: %.3f, DD: %.3f, DC: %.3f, CD: %.3f, CC: %.3f}\n' % (p0[0], p0[1], p0[2], p0[3], p0[4]), '(agent1) = {S: %.3f, DD: %.3f, DC: %.3f, CD: %.3f, CC: %.3f}\n' % (p1[0], p1[1], p1[2], p1[3], p1[4]), '(agent2) = {S: %.3f, DD: %.3f, DC: %.3f, CD: %.3f, CC: %.3f}' % (p2[0], p2[1], p2[2], p2[3], p2[4]))
                 # print('theta: ', self.policy.theta, '\n', 'z1: ',  self.agent1.z, '\n', 'z2: ',  self.agent2.z)
         return joint_scores
     
-    def policy_update_true(self):
-        # Batching not needed here.
-        self.policy.theta_optimizer.zero_grad()
-        theta1 = self.agent1.z + self.policy.theta
-        theta2 = self.agent2.z + self.policy.theta
-        objective = (true_objective(theta1, theta2, ipd) + true_objective(theta2,theta1, ipd))
-        objective.backward()
-        self.policy.theta_optimizer.step()
-        return objective
-    
     def policy_update_pg(self):
         """
-        TODO:
-        Will need batching
+        Policy Gradient for theta using Dice Objective. Treat theta as shared parameters
         """
-        pass
 
-    def lola_update_exact(self):
+        # First using Agent 1
+        (s1, s2), _ = ipd.reset()
+        memory1 = Memory(self.args)
+        memory2 = Memory(self.args)
+        for t in range(self.args.len_rollout):
+            a1, lp1, v1 = self.policy.act(s1, self.agent1.z, self.agent1.values)
+            a2, lp2, v2 = self.policy.act(s2, self.agent2.z, self.agent2.values)
+            (s1, s2), (r1, r2),_,_ = ipd.step((a1, a2))
+            memory1.add(lp1, lp2, v1, torch.from_numpy(r1).float())
+            memory2.add(lp2, lp1, v2, torch.from_numpy(r2).float())
+
+        # update self z
+        objective = memory1.dice_objective(only_self=True) +  memory2.dice_objective(only_self=True)
+        self.policy.policy_update(objective)
+        # # update self value:
+        # v_loss = memory1.value_loss()
+        # self.value_update(v_loss)
+
+        return objective
+
+    def lola_update_dice(self):
         """
-        Do Lola Updates
+        Do Lola-DiCE Updates
         """
         # copy other's parameters:
         z1_ = self.agent1.z.clone().detach().requires_grad_(True)
         z2_ = self.agent2.z.clone().detach().requires_grad_(True)
+        values1_ = self.agent1.values.clone().detach().requires_grad_(True)
+        values2_ = self.agent2.values.clone().detach().requires_grad_(True)
 
         for k in range(self.args.lookaheads):
             # estimate other's gradients from in_lookahead:
-            grad2 = self.agent1.in_lookahead(self.policy.theta, z2_)
-            grad1 = self.agent2.in_lookahead(self.policy.theta, z1_)
+            grad2 = self.agent1.in_lookahead(z2_, values2_, self.policy)
+            grad1 = self.agent2.in_lookahead(z1_, values1_, self.policy)
             # update other's theta
             z2_ = z2_ - self.args.lr_in * grad2
             z1_ = z1_ - self.args.lr_in * grad1
 
         # update own parameters from out_lookahead:
-        self.agent1.out_lookahead(self.policy.theta, z2_)
-        self.agent2.out_lookahead(self.policy.theta, z1_)
+        self.agent1.out_lookahead(z2_, values2_, self.policy)
+        self.agent2.out_lookahead(z1_, values1_, self.policy)
 
 if __name__=="__main__":
     args = get_args()
@@ -229,3 +312,18 @@ if __name__=="__main__":
     polen.writer.close()
     if args.plot:
         plot(scores, args)
+
+
+# if __name__=="__main__":
+#     args = get_args()
+#     global ipd
+#     ipd = IPD(max_steps=args.len_rollout, batch_size=args.batch_size)
+#     scores = []
+#     for args.seed in [111, 112, 113, 114]:
+#         print('for Seed', args.seed)
+#         torch.manual_seed(args.seed)
+#         polen = Polen(args)
+#         scores.append(polen.train())
+#         polen.writer.close()
+#     if args.plot:
+#         plot_many(scores, args)
