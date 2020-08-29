@@ -19,8 +19,9 @@ from plotting import plot, plot_many
 
 def get_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('-lr_out', default=0.2, type=float, help='lr for outer loops')
-    parser.add_argument('-lr_in', default=0.3, type=float, help='lr for inner loops')
+    parser.add_argument('-lr_theta', default=0.2, type=float, help='lr for theta using Naive PG')
+    parser.add_argument('-lr_out', default=0.2, type=float, help='lr for outer loops of z')
+    parser.add_argument('-lr_in', default=0.3, type=float, help='lr for inner loops of z')
     parser.add_argument('-lr_v', default= 0.1, type=float, help='lr for vf for baseline')
     parser.add_argument('-lr_pen', default=0.3, type=float, help='Adam lr for PEN')
     parser.add_argument('-gamma', default=0.96, type=float, help='')
@@ -33,13 +34,30 @@ def get_args():
     parser.add_argument('-nbins', default=15, type=int, help='No of bins to discretize return space')
     parser.add_argument('-logdir', default='logdir/', type=str, help='Logging Directory')
     parser.add_argument('-pen_hidden', default=80, type=int, help='Hidden size of PEN')
-    parser.add_argument('-n_policy', default=10, type=int, help='No of policy updates for each algo iteration')
+    parser.add_argument('-n_policy', default=1, type=int, help='No of policy updates for each algo iteration')
     parser.add_argument('-n_pen', default=10, type=int, help='')
     parser.add_argument('-nsamples_bin', default=30, type=int, help='No of rollouts for given z1/z2 to compute histogram of returns. Usually 2*nbins')
-    parser.add_argument('-plot', action='store_true', help='Enable Plotting')
-    parser.add_argument('-use_baseline', default=True, action='store_true', help='Enable Baseline in Dice')
-
+    parser.add_argument('-not_plot', action='store_true', help='Disable Plotting')
+    parser.add_argument('-not_use_baseline', action='store_true', help='Disable Baseline in Dice')
+    parser.add_argument('-only_self', action='store_true', help='Enable Plotting')
+    parser.add_argument('-use_exact_lola', action='store_true', help='Disable Plotting')
     return parser.parse_args()
+
+def phi(x1,x2):
+    return [x1*x2, x1*(1-x2), (1-x1)*x2,(1-x1)*(1-x2)]
+
+def true_objective(theta1, theta2, ipd):
+    p1 = torch.sigmoid(theta1)
+    p2 = torch.sigmoid(theta2[[0,1,3,2,4]])
+    p0 = (p1[0], p2[0])
+    p = (p1[1:], p2[1:])
+    # create initial laws, transition matrix and rewards:
+    P0 = torch.stack(phi(*p0), dim=0).view(1,-1)
+    P = torch.stack(phi(*p), dim=1)
+    R = torch.from_numpy(ipd.payout_mat).view(-1,1).float()
+    # the true value to optimize:
+    objective = (P0.mm(torch.inverse(torch.eye(4) - args.gamma*P))).mm(R)
+    return -objective
 
 def magic_box(x):
     return torch.exp(x - x.detach())
@@ -86,7 +104,7 @@ class Memory():
         # dice objective:
         dice_objective = torch.mean(torch.sum(magic_box(dependencies) * discounted_rewards, dim=1))
 
-        if self.args.use_baseline:
+        if not self.args.not_use_baseline:
             # variance_reduction:
             baseline_term = torch.mean(torch.sum((1 - magic_box(stochastic_nodes)) * discounted_values, dim=1))
             dice_objective = dice_objective + baseline_term
@@ -152,6 +170,14 @@ class Agent():
         v_loss = memory.value_loss()
         self.value_update(v_loss)
 
+    def in_lookahead_exact(self, theta, other_z):
+        other_objective = true_objective(theta + other_z, theta + self.z, ipd)
+        grad = get_gradient(other_objective, other_z)
+        return grad
+
+    def out_lookahead_exact(self, theta, other_z):
+        objective = true_objective(theta + self.z, theta + other_z, ipd)
+        self.z_update(objective)
 
 class Polen():
     def __init__(self, args):
@@ -208,10 +234,14 @@ class Polen():
         joint_scores = []
         for update in range(self.args.n_iter):
             # 1a. For fixed z1 & z2, Learn steerable policy theta & PEN by maximizing rollouts
+            # if update % self.args.n_policy == 0:
             for t in range(self.args.n_policy):
                 # Update steerable policy parameters. True possible for IPD
-                # policy_loss = self.policy_update_true()
-                policy_loss = self.policy_update_pg()
+                if self.args.use_exact_lola:
+                    policy_loss = self.policy_update_true()
+                else:
+                    policy_loss = self.policy_update_pg()
+                # self.writer.add_scalar('PolicyObjective V1 plus V2', -policy_loss, update/self.args.n_policy)
                 self.writer.add_scalar('PolicyObjective V1 plus V2', -policy_loss, update*self.args.n_policy + t )
 
             # 1b. Train the PEN
@@ -236,7 +266,10 @@ class Polen():
                 self.writer.add_scalar('PEN Loss: KL1 plus KL2', pen_loss, update*self.args.n_pen + t )
         
             # 2. Do on Lola Updates
-            self.lola_update_dice()
+            if self.args.use_exact_lola:
+                self.lola_update_exact()
+            else:
+                self.lola_update_dice()
             
             # evaluate:
             score = self.rollout(self.args.len_rollout)
@@ -255,6 +288,17 @@ class Polen():
                 # print('theta: ', self.policy.theta, '\n', 'z1: ',  self.agent1.z, '\n', 'z2: ',  self.agent2.z)
         return joint_scores
     
+    def policy_update_true(self):
+        # Batching not needed here.
+        self.policy.theta_optimizer.zero_grad()
+        theta_ = self.policy.theta.clone().detach()
+        theta1 = self.agent1.z + self.policy.theta
+        theta2 = self.agent2.z + self.policy.theta
+        objective = true_objective(self.agent1.z + self.policy.theta, self.agent2.z + theta_, ipd) + true_objective(self.agent2.z + self.policy.theta, self.agent1.z + theta_, ipd)
+        objective.backward()
+        self.policy.theta_optimizer.step()
+        return objective
+    
     def policy_update_pg(self):
         """
         Policy Gradient for theta using Dice Objective. Treat theta as shared parameters
@@ -272,12 +316,11 @@ class Polen():
             memory2.add(lp2, lp1, v2, torch.from_numpy(r2).float())
 
         # update self z
-        objective = memory1.dice_objective(only_self=True) +  memory2.dice_objective(only_self=True)
+        objective = memory1.dice_objective(only_self=self.args.only_self) +  memory2.dice_objective(only_self=self.args.only_self)
         self.policy.policy_update(objective)
         # # update self value:
-        # v_loss = memory1.value_loss()
-        # self.value_update(v_loss)
-
+        self.agent1.value_update(memory1.value_loss())
+        self.agent2.value_update(memory2.value_loss())
         return objective
 
     def lola_update_dice(self):
@@ -301,6 +344,26 @@ class Polen():
         # update own parameters from out_lookahead:
         self.agent1.out_lookahead(z2_, values2_, self.policy)
         self.agent2.out_lookahead(z1_, values1_, self.policy)
+    
+    def lola_update_exact(self):
+        """
+        Do Lola Updates
+        """
+        # copy other's parameters:
+        z1_ = self.agent1.z.clone().detach().requires_grad_(True)
+        z2_ = self.agent2.z.clone().detach().requires_grad_(True)
+
+        for k in range(self.args.lookaheads):
+            # estimate other's gradients from in_lookahead:
+            grad2 = self.agent1.in_lookahead_exact(self.policy.theta, z2_)
+            grad1 = self.agent2.in_lookahead_exact(self.policy.theta, z1_)
+            # update other's theta
+            z2_ = z2_ - self.args.lr_in * grad2
+            z1_ = z1_ - self.args.lr_in * grad1
+
+        # update own parameters from out_lookahead:
+        self.agent1.out_lookahead_exact(self.policy.theta, z2_)
+        self.agent2.out_lookahead_exact(self.policy.theta, z1_)
 
 if __name__=="__main__":
     args = get_args()
@@ -310,8 +373,8 @@ if __name__=="__main__":
     polen = Polen(args)
     scores = polen.train()
     polen.writer.close()
-    if args.plot:
-        plot(scores, args)
+    if not args.not_plot:
+        plot(scores, args.lookaheads)
 
 
 # if __name__=="__main__":
@@ -319,11 +382,11 @@ if __name__=="__main__":
 #     global ipd
 #     ipd = IPD(max_steps=args.len_rollout, batch_size=args.batch_size)
 #     scores = []
-#     for args.seed in [111, 112, 113, 114]:
+#     for args.seed in [1234,635,234,2445,678]:
 #         print('for Seed', args.seed)
 #         torch.manual_seed(args.seed)
 #         polen = Polen(args)
 #         scores.append(polen.train())
 #         polen.writer.close()
-#     if args.plot:
+#     if not args.not_plot:
 #         plot_many(scores, args)

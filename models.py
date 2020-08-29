@@ -34,7 +34,7 @@ class SteerablePolicy():
     def __init__(self, args):
         # self.theta = nn.Parameter(torch.randn(5, requires_grad=True))
         self.theta = nn.Parameter(torch.zeros(5, requires_grad=True))
-        self.theta_optimizer = torch.optim.Adam(params=(self.theta,),lr=args.lr_out)
+        self.theta_optimizer = torch.optim.Adam(params=(self.theta,),lr=args.lr_theta)
     
     def policy_update(self, objective):
         self.theta_optimizer.zero_grad()
