@@ -8,8 +8,9 @@ import torch.nn.functional as F
 from torch.distributions import Bernoulli
 
 class PolicyEvaluationNetwork(nn.Module):
-    def __init__(self, args, no_avg=False):
+    def __init__(self, args, device, no_avg=False):
         super(PolicyEvaluationNetwork, self).__init__()
+        self.device = device
         self.linear1 = nn.Linear(2*args.embedding_size, args.pen_hidden, bias=True)
         self.linear2 = nn.Linear(args.pen_hidden, args.pen_hidden, bias=True)
         # Output a distribution of Returns ( Look at Distributional RL too ?? )
@@ -31,6 +32,7 @@ class PolicyEvaluationNetwork(nn.Module):
     def forward(self, z1, z2):
         # Compute Distribution over returns in log space. To get probs take softmax.
         # TODO: Do we need to input $\theta$ as well??
+        z1, z2 = z1.to(self.device), z2.to(self.device)
         x = F.relu(self.linear1(torch.cat((z1,z2), dim=1)))
         x = F.relu(self.linear2(x))
         return self.out(x)
@@ -43,10 +45,11 @@ class PolicyEvaluationNetwork(nn.Module):
         return -(F.softmax(h1)*self.mids).sum()
 
 class PolicyEvaluationNetwork_2(nn.Module):
-    def __init__(self, args):
+    def __init__(self, args, device):
+        super(PolicyEvaluationNetwork_2, self).__init__()
         ''' PEN without Distributional Output
         '''
-        super(PolicyEvaluationNetwork_2, self).__init__()
+        self.device = device
         self.linear1 = nn.Linear(2*args.embedding_size, args.pen_hidden, bias=True)
         self.linear2 = nn.Linear(args.pen_hidden, args.pen_hidden, bias=True)
         self.linear3 = nn.Linear(args.pen_hidden, args.pen_hidden, bias=True)
@@ -62,6 +65,7 @@ class PolicyEvaluationNetwork_2(nn.Module):
 
     def forward(self, z1, z2):
         # Compute Distribution over returns in log space. To get probs take softmax.
+        z1, z2 = z1.to(self.device), z2.to(self.device)
         x = F.relu(self.linear1(torch.cat((z1,z2), dim=1)))
         x = F.relu(self.linear2(x))
         x = F.relu(self.linear3(x))
@@ -72,9 +76,10 @@ class PolicyEvaluationNetwork_2(nn.Module):
 
 
 class SteerablePolicy():
-    def __init__(self, args):
+    def __init__(self, args, device):
         # self.theta = nn.Parameter(torch.randn(5, requires_grad=True))
-        self.theta = nn.Parameter(torch.zeros(5, requires_grad=True))
+        self.device = device
+        self.theta = nn.Parameter(torch.zeros(5, requires_grad=True).to(self.device))
         self.theta_optimizer = torch.optim.Adam(params=(self.theta,),lr=args.lr_theta)
     
     def policy_update(self, objective):
@@ -84,19 +89,19 @@ class SteerablePolicy():
 
     def act(self, batch_states, z, values=None):
         batch_states = torch.from_numpy(batch_states).long()
-        conditioned_vec = self.theta + z
+        conditioned_vec = self.theta + z.to(self.device)
         probs = torch.sigmoid(conditioned_vec)[batch_states]
         m = Bernoulli(1-probs)
         actions = m.sample()
         log_probs_actions = m.log_prob(actions)
         if values is not None:    
-            return actions.numpy().astype(int), log_probs_actions, values[batch_states]
+            return actions.cpu().numpy().astype(int), log_probs_actions, values[batch_states]
         else:
-            return actions.numpy().astype(int), log_probs_actions
+            return actions.cpu().numpy().astype(int), log_probs_actions
     
     def act_parallel(self, batch_states, batch_z, values=None):
         batch_states = torch.from_numpy(batch_states).long()
-        batch_conditioned_vec = self.theta + batch_z
+        batch_conditioned_vec = self.theta + batch_z.to(self.device)
         probs = torch.sigmoid(batch_conditioned_vec).gather(1, batch_states.view(-1,1)).squeeze(1)
         m = Bernoulli(1-probs)
         actions = m.sample()

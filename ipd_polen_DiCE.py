@@ -43,19 +43,22 @@ def get_args():
     parser.add_argument('-pen_epochs', default=2, type=int, help='Batch size for training PEN')
     parser.add_argument('-nsamples_bin', default=75, type=int, help='No of rollouts for given z1/z2 to compute histogram of returns. Usually 2*nbins')
     parser.add_argument('-not_plot', action='store_true', help='Disable Plotting')
+    parser.add_argument('-use_cuda', action='store_true', help='Use CUDA')
+    parser.add_argument('-use_kl', action='store_true', help='Use KL for pen loss')
     parser.add_argument('-not_use_baseline', action='store_true', help='Disable Baseline in Dice')
     parser.add_argument('-only_self', action='store_true', help='Enable Plotting')
     parser.add_argument('-use_exact_lola', action='store_true', help='Disable Plotting')
     return parser.parse_args()
 
 class Agent():
-    def __init__(self, args):
+    def __init__(self, args, device):
         # init z and its optimizer
         self.args = args
-        self.z = nn.Parameter(torch.zeros(self.args.embedding_size, requires_grad=True))
+        self.device = device
+        self.z = nn.Parameter(torch.zeros(self.args.embedding_size, requires_grad=True).to(self.device))
         self.z_optimizer = torch.optim.Adam((self.z,),lr=self.args.lr_out)
         # init values and its optimizer
-        self.values = nn.Parameter(torch.zeros(self.args.embedding_size, requires_grad=True))
+        self.values = nn.Parameter(torch.zeros(self.args.embedding_size, requires_grad=True).to(self.device))
         self.value_optimizer = torch.optim.Adam((self.values,),lr=self.args.lr_v)
 
     def z_update(self, objective):
@@ -122,10 +125,16 @@ class Polen():
             1. Initialize Agent embeddings z, poliy theta & pen psi
             """
             self.args = args
-            self.agent1 = Agent(self.args)
-            self.agent2 = Agent(self.args)
-            self.policy = SteerablePolicy(self.args)
-            self.pen = PolicyEvaluationNetwork_2(self.args)
+            self.device = torch.device("cuda:0" if (torch.cuda.is_available() and self.args.use_cuda) else "cpu")
+            print('Using Device: ', self.device)
+            self.agent1 = Agent(self.args, self.device)
+            self.agent2 = Agent(self.args, self.device)
+            self.policy = SteerablePolicy(self.args, self.device)
+            if self.args.use_kl:
+                self.pen = PolicyEvaluationNetwork(self.args, self.device, no_avg=True)
+            else:
+                self.pen = PolicyEvaluationNetwork_2(self.args, self.device)
+            self.pen.to(self.device)
             self.pen_optimizer = torch.optim.Adam(params=self.pen.parameters(), lr=args.lr_pen)
             self.ipd2 = IPD(max_steps=args.len_rollout, batch_size=args.nsamples_bin)
             self.ipd3 = IPD(max_steps=args.len_rollout, batch_size=args.pen_batch_size)
@@ -208,11 +217,11 @@ class Polen():
             for t, sampled_batch in enumerate(dloader_train):
                 z1s, z2s = sampled_batch
                 pen_train_loss = self.pen_update_no_kl(z1s, z2s, use_true_vf=True)
-                self.writer.add_scalar('PEN Train Loss', pen_train_loss, pen_steps)
-                if t%20 == 0:
+                self.writer.add_scalar('PEN_LOSS/Train', pen_train_loss, pen_steps*self.args.pen_batch_size)
+                if t%100 == 0:
                     #Compute test stats
                     pen_test_loss = self.pen_update_no_kl(pen_test.z1s, pen_test.z2s, eval=True, use_true_vf=True)
-                    self.writer.add_scalar('PEN Test Loss', pen_test_loss, pen_steps)
+                    self.writer.add_scalar('PEN_LOSS/Test', pen_test_loss, pen_steps*self.args.pen_batch_size)
                     print('Epoch: {}, After {} iter,  Train Loss: {} , Test Loss: {}'.format(epoch, t, pen_train_loss, pen_test_loss))
                 pen_steps += 1
                 # self.writer.add_scalar('MSE V1 and R1', mse_1, t)
@@ -241,10 +250,10 @@ class Polen():
             if self.args.use_exact_lola:
                 # self.lola_update_exact()
                 grad_diff, grad_cos_1, grad_cos_2, grads = self.lola_update_pen()
-                self.writer.add_scalar('Grad_MSE', grad_diff, update)
-                self.writer.add_scalar('Grad_COS_1', grad_cos_1, update)
-                self.writer.add_scalar('Grad_COS_2', grad_cos_2, update)
-                self.writer.add_scalar('Norm of Gradients from PEN', grads, update)
+                self.writer.add_scalar('LOLA_Grads/Grad_MSE', grad_diff, update)
+                self.writer.add_scalar('LOLA_Grads/Grad_COS_1', grad_cos_1, update)
+                self.writer.add_scalar('LOLA_Grads/Grad_COS_2', grad_cos_2, update)
+                self.writer.add_scalar('LOLA_Grads/Norm of Gradients from PEN', grads, update)
             else:
                 self.lola_update_dice()
             
@@ -269,8 +278,12 @@ class Polen():
                 print('True Value ({}, {})'.format(v_true_1, v_true_2))
                 print('PEN Value ({}, {})'.format(v_pen_1, v_pen_2))
                 print('Default = {S: %.3f, DD: %.3f, DC: %.3f, CD: %.3f, CC: %.3f}\n' % (p0[0], p0[1], p0[2], p0[3], p0[4]), '(agent1) = {S: %.3f, DD: %.3f, DC: %.3f, CD: %.3f, CC: %.3f}\n' % (p1[0], p1[1], p1[2], p1[3], p1[4]), '(agent2) = {S: %.3f, DD: %.3f, DC: %.3f, CD: %.3f, CC: %.3f}' % (p2[0], p2[1], p2[2], p2[3], p2[4]))
-                self.writer.add_scalars('Value Comparisons(Agent_1) vs Time', {'Sampled in env': v_env_1, 'True Value':v_true_1, 'PEN Value':v_pen_1}, update)
-                self.writer.add_scalars('Value Comparisons(Agent_2) vs Time', {'Sampled in env': v_env_2, 'True Value':v_true_2, 'PEN Value':v_pen_2}, update)
+                self.writer.add_scalar('Value_Agent_1/Sampled in env', v_env_1, update)
+                self.writer.add_scalar('Value_Agent_1/True Value', v_true_1, update)
+                self.writer.add_scalar('Value_Agent_1/PEN Value', v_pen_1, update)
+                self.writer.add_scalar('Value_Agent_2/Sampled in env', v_env_2, update)
+                self.writer.add_scalar('Value_Agent_2/True Value', v_true_2, update)
+                self.writer.add_scalar('Value_Agent_2/PEN Value', v_pen_2, update)
         return joint_scores, p0, p1, p2
 
     def pen_update(self):
@@ -322,10 +335,10 @@ class Polen():
             target_1, target_2 = [], []
             # TODO: See if can parallelize this
             for i in range(z1s.shape[0]):
-                target_1.append(-true_objective(self.policy.theta + z1s[i], self.policy.theta + z2s[i], ipd))
-                target_2.append(-true_objective(self.policy.theta + z2s[i], self.policy.theta + z1s[i], ipd))
-            target_1 = torch.tensor(target_1)
-            target_2 = torch.tensor(target_2)
+                target_1.append(-true_objective(self.policy.theta.cpu()  + z1s[i], self.policy.theta.cpu()  + z2s[i], ipd))
+                target_2.append(-true_objective(self.policy.theta.cpu() + z2s[i], self.policy.theta.cpu()  + z1s[i], ipd))
+            target_1 = torch.tensor(target_1).to(self.device)
+            target_2 = torch.tensor(target_2).to(self.device)
         else:
             target_1, target_2 = self.rollout_binning_batch(self.args.len_rollout, z1s, z2s)
 
@@ -461,6 +474,7 @@ class Polen():
 if __name__=="__main__":
     args = get_args()
     global ipd
+    
     ipd = IPD(max_steps=args.len_rollout, batch_size=args.batch_size)
     torch.manual_seed(args.seed)
     polen = Polen(args)
