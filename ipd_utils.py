@@ -8,8 +8,8 @@ import torch.nn.functional as F
 from torch.distributions import Bernoulli
 from torch.utils.data import Dataset, DataLoader
 from copy import deepcopy
+import random
 from envs import IPD
-# from torch.utils.tensorboard import SummaryWriter
 from tensorboardX import SummaryWriter
 
 def sigmoid_inv(x):
@@ -104,3 +104,47 @@ class PenDataset(Dataset):
     
     def __getitem__(self, idx):
         return self.z1s[idx], self.z2s[idx]
+
+class ReplayBuffer:
+    """
+    Replay buffer...
+    """
+    def __init__(self, size, dim):
+        self._storage = []
+        self._dim = dim
+        self._maxsize = size
+        self._next_idx = 0
+
+    def __len__(self):
+        return len(self._storage)
+
+    def add(self, z1, z2):
+        data = (z1, z2)
+        if self._next_idx >= len(self._storage):
+            self._storage.append(data)
+        else:
+            self._storage[self._next_idx] = data
+        self._next_idx = (self._next_idx + 1) % self._maxsize
+    
+    def add_surround(self, z1, z2, num_samples, var=2):
+        for _ in range(num_samples):
+            # Generate z1s & z2s aroud z1, z2 sampled from the buffer
+            z1_sampled = torch.rand(self._dim)*var + z1
+            z2_sampled = torch.rand(self._dim)*var + z2
+            self.add(z1_sampled, z2_sampled)
+
+    def sample(self):
+        # import ipdb; ipdb.set_trace()
+        return self._storage[random.randint(0, len(self._storage) - 1)]
+
+    def sample_batch(self, batch_size):
+        idxes = [random.randint(0, len(self._storage) - 1) for _ in range(batch_size)]
+        return self._encode_sample(idxes)
+    
+    def _encode_sample(self, idxes):
+        z1s, z2s = [], []
+        for i in idxes:
+            z1, z2 = self._storage[i]
+            z1s.append(z1)
+            z2s.append(z2)
+        return np.array(z1s), np.array(z2s)

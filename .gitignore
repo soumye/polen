@@ -2,4 +2,5 @@ envs/__pycache__/*
 __pycache__/*
 imgs/*
 logdir/*
+saved_models/*
 .vscode
