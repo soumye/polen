@@ -53,7 +53,7 @@ class Memory():
         self.values.append(v)
         self.rewards.append(r)
 
-    def dice_objective(self, only_self=False):
+    def dice_objective(self, dice_both=False):
         # bsz x traj_len
         self_logprobs = torch.stack(self.self_logprobs, dim=1)
         other_logprobs = torch.stack(self.other_logprobs, dim=1)
@@ -66,7 +66,7 @@ class Memory():
         discounted_values = values * cum_discount
 
         # stochastics nodes involved in rewards dependencies:
-        if only_self:
+        if not dice_both:
             dependencies = torch.cumsum(self_logprobs, dim=1)
             # logprob of each stochastic nodes:
             stochastic_nodes = self_logprobs
