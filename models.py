@@ -52,7 +52,7 @@ class PolicyEvaluationNetwork_2(nn.Module):
         self.device = device
         self.linear1 = nn.Linear(2*args.embedding_size, args.pen_hidden, bias=True)
         self.linear2 = nn.Linear(args.pen_hidden, args.pen_hidden, bias=True)
-        self.linear3 = nn.Linear(args.pen_hidden, args.pen_hidden, bias=True)
+        # self.linear3 = nn.Linear(args.pen_hidden, args.pen_hidden, bias=True)
         # Output Scalar Predicted Returns
         self.out = nn.Linear(args.pen_hidden, 1)
 
@@ -60,15 +60,15 @@ class PolicyEvaluationNetwork_2(nn.Module):
         # Glorot Initialization
         torch.nn.init.xavier_normal_(self.linear1.weight, std=0.1)
         torch.nn.init.xavier_normal_(self.linear2.weight, std=0.1)
-        torch.nn.init.xavier_normal_(self.linear3.weight, std=0.1)
+        # torch.nn.init.xavier_normal_(self.linear3.weight, std=0.1)
         torch.nn.init.xavier_normal_(self.out.weight, std=0.1)
 
     def forward(self, z1, z2):
         # Compute Distribution over returns in log space. To get probs take softmax.
         z1, z2 = z1.to(self.device), z2.to(self.device)
-        x = F.relu(self.linear1(torch.cat((z1,z2), dim=1)))
-        x = F.relu(self.linear2(x))
-        x = F.relu(self.linear3(x))
+        x = torch.tanh(self.linear1(torch.cat((z1,z2), dim=1)))
+        x = torch.tanh(self.linear2(x))
+        # x = torch.tanh(self.linear3(x))
         return self.out(x)
     
     def predict(self, z1, z2):
@@ -100,6 +100,7 @@ class SteerablePolicy():
             return actions.cpu().numpy().astype(int), log_probs_actions
     
     def act_parallel(self, batch_states, batch_z, values=None):
+        assert (batch_states.shape[0] == batch_z.shape[0])
         batch_states = torch.from_numpy(batch_states).long()
         batch_conditioned_vec = self.theta + batch_z.to(self.device)
         probs = torch.sigmoid(batch_conditioned_vec).gather(1, batch_states.view(-1,1)).squeeze(1)

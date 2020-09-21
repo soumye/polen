@@ -31,24 +31,28 @@ class IteratedPrisonersDilemma(gym.Env):
         self.observation_space = Tuple([
             OneHot(self.NUM_STATES) for _ in range(self.NUM_AGENTS)
         ])
-        self.available_actions = [
+        self.step_count = None
+    
+    def available_actions(self, batch_size):
+        return [
             np.ones((batch_size, self.NUM_ACTIONS), dtype=int)
             for _ in range(self.NUM_AGENTS)
         ]
 
-        self.step_count = None
-
-    def reset(self):
+    def reset(self, batch_size=None):
+        if batch_size is None:
+            batch_size = self.batch_size
         self.step_count = 0
-        init_state = np.zeros(self.batch_size)
+        init_state = np.zeros(batch_size)
         observation = [init_state, init_state]
-        info = [{'available_actions': aa} for aa in self.available_actions]
+        info = [{'available_actions': aa} for aa in self.available_actions(batch_size)]
         return observation, info
 
-    def step(self, action):
+    def step(self, action, batch_size=None):
+        if batch_size is None:
+            batch_size = self.batch_size
         ac0, ac1 = action
         self.step_count += 1
-
         r0 = self.payout_mat[ac0, ac1]
         r1 = self.payout_mat[ac1, ac0]
         s0 = self.states[ac0, ac1]
@@ -56,5 +60,5 @@ class IteratedPrisonersDilemma(gym.Env):
         observation = [s0, s1]
         reward = [r0, r1]
         done = (self.step_count == self.max_steps)
-        info = [{'available_actions': aa} for aa in self.available_actions]
+        info = [{'available_actions': aa} for aa in self.available_actions(batch_size)]
         return observation, reward, done, info

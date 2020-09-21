@@ -126,7 +126,7 @@ class ReplayBuffer:
             self._storage[self._next_idx] = data
         self._next_idx = (self._next_idx + 1) % self._maxsize
     
-    def add_surround(self, z1, z2, num_samples, var=2):
+    def add_surround(self, z1, z2, num_samples, var=1):
         for _ in range(num_samples):
             # Generate z1s & z2s aroud z1, z2 sampled from the buffer
             z1_sampled = torch.rand(self._dim)*var + z1
@@ -147,4 +147,4 @@ class ReplayBuffer:
             z1, z2 = self._storage[i]
             z1s.append(z1)
             z2s.append(z2)
-        return np.array(z1s), np.array(z2s)
+        return torch.stack(z1s), torch.stack(z2s)
