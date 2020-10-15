@@ -15,11 +15,13 @@ class Agent():
         self.ipd = ipd
         if val is None:
             self.z = nn.Parameter(torch.zeros(self.args.embedding_size, requires_grad=True).to(self.device))
+            # self.z = nn.Parameter(torch.randn(self.args.embedding_size, requires_grad=True).to(self.device))
         else:
             self.z = nn.Parameter(val.requires_grad_().to(self.device))
         self.z_optimizer = torch.optim.Adam((self.z,),lr=self.args.lr_out)
-        # init values and its optimizer
-        self.values = nn.Parameter(torch.zeros(self.args.embedding_size, requires_grad=True).to(self.device))
+        # init values(for each of 5 states of IPD) and its optimizer
+        self.values = nn.Parameter(torch.zeros(5, requires_grad=True).to(self.device))
+        # self.values = nn.Parameter(torch.zeros(self.args.embedding_size, requires_grad=True).to(self.device))
         self.value_optimizer = torch.optim.Adam((self.values,),lr=self.args.lr_v)
 
     def z_update(self, objective, eval=False):
@@ -64,13 +66,13 @@ class Agent():
         self.value_update(v_loss)
         return grad_z
 
-    def in_lookahead_exact(self, theta, other_z):
-        other_objective = true_objective(theta + other_z, theta + self.z, self.ipd)
+    def in_lookahead_exact(self, policy, other_z):
+        other_objective = true_objective(policy.fwd(other_z), policy.fwd(self.z), self.ipd)
         grad = get_gradient(other_objective, other_z)
         return grad
 
-    def out_lookahead_exact(self, theta, other_z, eval=False):
-        objective = true_objective(theta + self.z, theta + other_z, self.ipd)
+    def out_lookahead_exact(self, policy, other_z, eval=False):
+        objective = true_objective(policy.fwd(self.z), policy.fwd(other_z), self.ipd)
         grads = self.z_update(objective, eval)
         return grads
     

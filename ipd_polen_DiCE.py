@@ -4,6 +4,7 @@ import numpy as np
 import argparse
 import torch
 import os
+import copy
 import time
 from tqdm import tqdm
 from shutil import rmtree
@@ -15,21 +16,22 @@ from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from envs import IPD
-from models import PolicyEvaluationNetwork, SteerablePolicy, PolicyEvaluationNetwork_2
 from ipd_agent import Agent
+from models import *
 from plotting import *
 from ipd_utils import *
 
 def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('-logdir', default='logdir/',   type=str, help='Logging Directory')
-    parser.add_argument('-savedir', default='saved_models/', type=str, help='Logging Directory')
+    parser.add_argument('-savedir', default='saved_models_2/', type=str, help='Logging Directory')
     parser.add_argument('-embedding_size', default=5, type=int, help='Size of the embedding z')
     parser.add_argument('-gamma', default=0.96, type=float, help='')
     parser.add_argument('-len_rollout', default=100, type=int, help='Length of rollouts')
     parser.add_argument('-ipd_batch_size', default=128, type=int, help='Batch size of IPD estimates')
     parser.add_argument('-seed', default=911, type=int, help='Random Seed')
     parser.add_argument('-lookaheads', default=2, type=int, help='No of lola lookaheads')
+    parser.add_argument('-grads', default='pen', type=str, help='pen, dice, true: Options for LOLA gradients')
     # Learning Rates
     parser.add_argument('-lr_theta', default=0.02, type=float, help='lr for theta using Naive PG')
     parser.add_argument('-lr_out', default=0.2, type=float, help='lr for outer loops of z')
@@ -39,7 +41,9 @@ def get_args():
     # Ratios
     parser.add_argument('-n_iter', default=200, type=int, help='No of algo iteration')
     parser.add_argument('-n_policy', default=0, type=int, help='No of policy updates for each algo iteration')
-    parser.add_argument('-n_pen', default=10, type=int, help='No of pen refining steps per iteration')
+    parser.add_argument('-n_pen', default=5, type=int, help='No of pen refining steps per iteration')
+    #Policy HPS
+    parser.add_argument('-policy_hidden', default=128, type=int, help='Hidden size of Policy Net')
     #PEN HPS
     parser.add_argument('-pen_hidden', default=128, type=int, help='Hidden size of PEN')
     parser.add_argument('-pen_train_size', default=50000, type=int, help='PEN train size')
@@ -52,8 +56,9 @@ def get_args():
         help='No of rollouts for givenz1/z2 to compute target of return. Usually 2*nbins')
     # Booleans
     parser.add_argument('-not_use_baseline', action='store_true', help='Disable Baseline in Dice')
+    parser.add_argument('-not_use_policy_net', action='store_true', help='Disable Baseline in Dice')
     parser.add_argument('-dice_both', action='store_true', help='Use both dependencies in Dice')
-    parser.add_argument('-use_pg', action='store_true', help='Use Policy gradient/Dice for theta/lola updates')
+    parser.add_argument('-use_pg', action='store_true', help='Use Policy gradient/Dice for theta updates')
     parser.add_argument('-use_kl', action='store_true', help='Use KL for pen loss')
     parser.add_argument('-pen_true_vf', action='store_true', help='Use true vf for training PEN')
     parser.add_argument('-fix_z2', action='store_true', help='Fix z2')
@@ -78,7 +83,15 @@ class Polen():
                 self.agent2 = Agent(self.args, self.device, self.ipd, val=torch.tensor([-20.0, 20.0, -20.0, 20.0, -20.0]))
             else:
                 self.agent2 = Agent(self.args, self.device, self.ipd)
-            self.policy = SteerablePolicy(self.args, self.device)
+            
+            if self.args.not_use_policy_net:
+                self.policy = SteerablePolicy(self.args, self.device)
+                self.policy_optimizer = torch.optim.Adam(params=(self.policy.theta,),lr=args.lr_theta)
+            else:
+                self.policy = SteerablePolicyNet(self.args, self.device)
+                self.policy.to(self.device)
+                self.policy_optimizer = torch.optim.Adam(params=self.policy.parameters(), lr=args.lr_theta)
+            z
             self.buffer = ReplayBuffer(size=self.args.buffer_size, dim=self.args.embedding_size)
             if self.args.use_kl:
                 self.pen = PolicyEvaluationNetwork(self.args, self.device, no_avg=True)
@@ -88,8 +101,8 @@ class Polen():
             self.pen_optimizer = torch.optim.Adam(params=self.pen.parameters(), lr=args.lr_pen)
             # self.pen_scheduler = torch.optim.lr_scheduler.StepLR(self.pen_optimizer, step_size=10, gamma=0.9)
             self.pth_1 = '2l_tanh/' + ('true_vf/' if self.args.pen_true_vf else ('sampled/num_' + str(self.args.nsamples_return)))
-            self.pth_2 = ('_KL_' if self.args.use_kl else '') + '_h_' + str(self.args.pen_hidden) + '_train_' + str(self.args.pen_train_size) + '_bsz_' + str(self.args.pen_batch_size) + '_ep_' + str(self.args.pen_epochs) + '_lr_'+ str(self.args.lr_pen) + '_seed_' + str(self.args.seed) + ('_gpu_' if self.args.gpu else '') + '.pth'
-            self.args.logdir = args.logdir + self.pth_1 + 'look_' + str(args.lookaheads) + '/n_pen' + str(args.n_pen) + '_lr_in_' + str(args.lr_in) + '_lr_out_' + str(args.lr_out) + self.pth_2
+            self.pth_2 = ('_KL_' if self.args.use_kl else '') + '_policy_h_' + str(self.args.policy_hidden) + '_h_' + str(self.args.pen_hidden) + '_train_' + str(self.args.pen_train_size) + '_bsz_' + str(self.args.pen_batch_size) + '_ep_' + str(self.args.pen_epochs) + '_lr_'+ str(self.args.lr_pen) + '_seed_' + str(self.args.seed) + ('_gpu_' if self.args.gpu else '') + '.pth'
+            self.args.logdir = args.logdir + self.pth_1 + 'look_' + str(args.lookaheads) + '/n_policy_' + str(args.n_policy) + '_n_pen' + str(args.n_pen) + '_lr_theta_' + str(args.lr_theta) + '_lr_in_' + str(args.lr_in)  + '_lr_out_' + str(args.lr_out) + '_emb_' + str(args.embedding_size) + self.pth_2
             if os.path.exists(self.args.logdir):
                 print('Removing existing')
                 rmtree(self.args.logdir)
@@ -104,10 +117,11 @@ class Polen():
         print(f"start iterations with {self.args.lookaheads} lookaheads")
         joint_scores = []
         PATH = self.args.savedir + self.pth_1 + self.pth_2
+        # PATH = 'saved_models/2l_tanh/true_vf/_h_128_train_50000_bsz_128_ep_3_lr_0.002_seed_911.pth'
         if os.path.exists(PATH):
             print('Loading Saved Model from : ', PATH)
             self.pen.load_state_dict(torch.load(PATH))
-        else:
+        elif self.args.grads == 'pen':
             print('Training PEN from Sratch------------')
             pen_train = PenDataset(self.args.pen_train_size, self.args.embedding_size)
             pen_test = PenDataset(self.args.pen_test_size, self.args.embedding_size)
@@ -134,31 +148,32 @@ class Polen():
         # Start main algo iterations
         for update in range(self.args.n_iter):
             # 1a. For fixed z1 & z2, Learn steerable policy theta & PEN by maximizing rollouts
-            # if update % self.args.n_policy == 0:
-            for t in range(self.args.n_policy):
+            if self.args.n_policy and update % self.args.n_policy == 0:
+            # for t in range(self.args.n_policy):
                 # Update steerable policy parameters. True possible for IPD
                 if not self.args.use_pg:
-                    policy_loss = self.policy_update_true()
+                    policy_loss = self.policy_update_true(step=update)
                 else:
                     policy_loss = self.policy_update_pg()
-                # self.writer.add_scalar('PolicyObjective V1 plus V2', -policy_loss, update/self.args.n_policy)
-                self.writer.add_scalar('PolicyObjective V1 plus V2', -policy_loss, update*self.args.n_policy + t )
-
-            self.buffer.add_surround(self.agent1.z.data, self.agent2.z.data, num_samples=self.args.pen_batch_size)
-            # Refine the PEN
-            if update%1==0 :
-                for t in range(self.args.n_pen):
-                    z1s, z2s = self.buffer.sample_batch(batch_size=self.args.pen_batch_size)
-                    # # Generate z1s & z2s aroud z1, z2 sampled from the buffer
-                    # z1s = (torch.rand((self.args.pen_batch_size,self.args.embedding_size)).to(self.device)) + z1_sample
-                    # z2s = (torch.rand((self.args.pen_batch_size,self.args.embedding_size)).to(self.device)) + z2_sample
-                    pen_train_loss = self.pen_update(z1s.to(self.device), z2s.to(self.device), use_true_vf=self.args.pen_true_vf)
-                    self.writer.add_scalar('PEN_Refine/Train', pen_train_loss, update*self.args.n_pen + t)
-                # self.pen_scheduler.step()
+                self.writer.add_scalar('PolicyObjective V1 plus V2', -policy_loss, update)
+                # self.writer.add_scalar('PolicyObjective V1 plus V2', -policy_loss, update*self.args.n_policy + t )
+            
+            if self.args.grads == 'pen':
+                self.buffer.add_surround(self.agent1.z.data, self.agent2.z.data, num_samples=self.args.pen_batch_size)
+                # Refine the PEN
+                if update%1==0 :
+                    for t in range(self.args.n_pen):
+                        z1s, z2s = self.buffer.sample_batch(batch_size=self.args.pen_batch_size)
+                        # # Generate z1s & z2s aroud z1, z2 sampled from the buffer
+                        # z1s = (torch.rand((self.args.pen_batch_size,self.args.embedding_size)).to(self.device)) + z1_sample
+                        # z2s = (torch.rand((self.args.pen_batch_size,self.args.embedding_size)).to(self.device)) + z2_sample
+                        pen_train_loss = self.pen_update(z1s.to(self.device), z2s.to(self.device), use_true_vf=self.args.pen_true_vf)
+                        self.writer.add_scalar('PEN_Refine/Train', pen_train_loss, update*self.args.n_pen + t)
+                    # self.pen_scheduler.step()
                 # print('New PEN lr rate ', self.pen_optimizer.param_groups[0]['lr'])
 
             # 2. Do Lola Updates
-            if not self.args.use_pg:
+            if self.args.grads == 'pen':
                 in_grads, out_grads = self.lola_update_pen(fix_z2=self.args.fix_z2)
                 self.writer.add_scalar('LOLA_Grads/MSE', in_grads[0], update)
                 self.writer.add_scalar('LOLA_Grads/COS_Similarity_1', in_grads[1], update)
@@ -169,8 +184,12 @@ class Polen():
                 self.writer.add_scalar('Outer_LOLA_Grads/COS_Similarity_1', out_grads[1], update)
                 self.writer.add_scalar('Outer_LOLA_Grads/COS_Similarity_2', out_grads[2], update)
                 self.writer.add_scalar('Outer_LOLA_Grads/Norm_PEN', out_grads[3], update)
-            else:
+            elif self.args.grads == 'dice':
                 self.lola_update_dice()
+            elif self.args.grads == 'true':
+                self.lola_update_exact()
+            else:
+                raise NotImplementedError 
             
             # Evaluate:
             score = self.rollout(self.args.len_rollout)
@@ -180,14 +199,15 @@ class Polen():
 
             # Logging
             if update%10==0 :
-                p0 = [p.item() for p in torch.sigmoid(self.policy.theta)]
-                p1 = [p.item() for p in torch.sigmoid(self.policy.theta + self.agent1.z)]
-                p2 = [p.item() for p in torch.sigmoid(self.policy.theta + self.agent2.z)]
-                self.writer.add_image('Defect Probs', plot_bar(p0, p1, p2), update) 
+                # import ipdb; ipdb.set_trace()
+                p0 = [p.item() for p in torch.sigmoid(self.policy.fwd(torch.zeros_like(self.agent1.z)))]
+                p1 = [p.item() for p in torch.sigmoid(self.policy.fwd(self.agent1.z))]
+                p2 = [p.item() for p in torch.sigmoid(self.policy.fwd(self.agent2.z))]
+                self.writer.add_image('Defect Probs', plot_scatter(p0, p1, p2), update) 
                 print('After update', update, '------------')
                 v_env_1, v_env_2 = score[0], score[1]
-                v_true_1 = -true_objective(self.policy.theta + self.agent1.z, self.policy.theta + self.agent2.z, self.ipd).data
-                v_true_2 = -true_objective(self.policy.theta + self.agent2.z, self.policy.theta + self.agent1.z, self.ipd).data
+                v_true_1 = -true_objective(self.policy.fwd(self.agent1.z), self.policy.fwd(self.agent2.z), self.ipd).data
+                v_true_2 = -true_objective(self.policy.fwd(self.agent2.z), self.policy.fwd(self.agent1.z), self.ipd).data
                 v_pen_1  = -self.pen.predict(self.agent1.z, self.agent2.z).data
                 v_pen_2 =  -self.pen.predict(self.agent2.z, self.agent1.z).data
                 print('Sampled Score in Env (%.3f,%.3f)' % (v_env_1, v_env_2))
@@ -211,18 +231,18 @@ class Polen():
             z1s (bsz x dimension):
             z2s (bsz x dimension):
             eval (bool, optional): Run in eval mode. No gradient steps on PEN. Defaults to False.
-            use_true_vf (bool, optional): Where to use True Value Function as target or 
+            use_true_vf (bool, optional): Whether to use True Value Function as target or 
             use returns computed from the environment. Defaults to True.
 
         Returns:
             pen_loss: The PEN MSE loss computed for the batch
-        """        
+        """
         if use_true_vf:
             target_1, target_2 = [], []
             # TODO: See if can parallelize this
             for i in range(z1s.shape[0]):
-                target_1.append(-true_objective(self.policy.theta.cpu() + z1s[i], self.policy.theta.cpu()  + z2s[i], self.ipd))
-                target_2.append(-true_objective(self.policy.theta.cpu() + z2s[i], self.policy.theta.cpu()  + z1s[i], self.ipd))
+                target_1.append(-true_objective(self.policy.fwd(z1s[i]), self.policy.fwd(z2s[i]), self.ipd))
+                target_2.append(-true_objective(self.policy.fwd(z2s[i]), self.policy.fwd(z1s[i]), self.ipd))
             target_1 = torch.tensor(target_1).to(self.device)
             target_2 = torch.tensor(target_2).to(self.device)
         else:
@@ -270,8 +290,8 @@ class Polen():
             # estimate other's gradients from in_lookahead:
             grad2 = self.agent1.in_lookahead_pen(self.pen, z2_)
             grad1 = self.agent2.in_lookahead_pen(self.pen, z1_)
-            grad2_ex = self.agent1.in_lookahead_exact(self.policy.theta, z2_)
-            grad1_ex = self.agent2.in_lookahead_exact(self.policy.theta, z1_)
+            grad2_ex = self.agent1.in_lookahead_exact(self.policy, z2_)
+            grad1_ex = self.agent2.in_lookahead_exact(self.policy, z1_)
             # update other's theta
             z2_ = z2_ - self.args.lr_in * grad2
             z1_ = z1_ - self.args.lr_in * grad1
@@ -282,11 +302,11 @@ class Polen():
         # update own parameters from out_lookahead:
         # Need to clone because grad is just a reference
         grad_z1_pen = self.agent1.out_lookahead_pen(self.pen, z2_).clone()
-        grad_z1_exact = self.agent1.out_lookahead_exact(self.policy.theta, z2_, eval=True)
+        grad_z1_exact = self.agent1.out_lookahead_exact(self.policy, z2_, eval=True)
 
         # if we fix_z2, then equal to just doing eval on it
         grad_z2_pen = self.agent2.out_lookahead_pen(self.pen, z1_, eval=fix_z2).clone()
-        grad_z2_exact = self.agent2.out_lookahead_exact(self.policy.theta, z1_, eval=True)
+        grad_z2_exact = self.agent2.out_lookahead_exact(self.policy, z1_, eval=True)
 
         out_grad_cos_1 = F.cosine_similarity(grad_z1_pen.unsqueeze(0), grad_z1_exact.unsqueeze(0))
         out_grad_cos_2 = F.cosine_similarity(grad_z2_pen.unsqueeze(0), grad_z2_exact.unsqueeze(0))
@@ -301,6 +321,18 @@ class Polen():
         return in_grads, out_grads
 
     def pen_update_kl(self):
+        """ Method to update PEN with KL Dive loss. DEPRECATED CURRENTLY
+
+        Args:
+            z1s (bsz x dimension):
+            z2s (bsz x dimension):
+            eval (bool, optional): Run in eval mode. No gradient steps on PEN. Defaults to False.
+            use_true_vf (bool, optional): Whether to use True Value Function as target or 
+            use returns computed from the environment. Defaults to True.
+
+        Returns:
+            pen_loss: The PEN MSE loss computed for the batch
+        """  
         # randomly generate z1, z2. Maybe generation centered on z0, z1 would be better.
         z1 = sigmoid_inv(torch.rand(self.args.embedding_size))
         z2 = sigmoid_inv(torch.rand(self.args.embedding_size))
@@ -328,16 +360,25 @@ class Polen():
 
         return pen_loss, mse_1, mse_2
  
-    def policy_update_true(self):
+    def policy_update_true(self, step):
         # Batching not needed here.
-        self.policy.theta_optimizer.zero_grad()
-        theta_ = self.policy.theta.clone().detach()
-        theta1 = self.agent1.z + self.policy.theta
-        theta2 = self.agent2.z + self.policy.theta
-        objective = true_objective(self.agent1.z + self.policy.theta, self.agent2.z + theta_, ipd)\
-             + true_objective(self.agent2.z + self.policy.theta, self.agent1.z + theta_, self.ipd)
-        objective.backward()
-        self.policy.theta_optimizer.step()
+        self.policy_optimizer.zero_grad()
+        # if self.args.not_use_policy_net:
+        #     theta_ = self.policy.theta.clone().detach()
+        #     objective = true_objective(self.agent1.z + self.policy.theta, self.agent2.z + theta_, self.ipd)\
+        #         + true_objective(self.agent2.z + self.policy.theta, self.agent1.z + theta_, self.ipd)
+        # else:
+        # objective = true_objective(self.policy.fwd(self.agent1.z), self.policy.fwd(self.agent2.z), self.ipd)\
+            # + true_objective(self.policy.fwd(self.agent2.z), self.policy.fwd(self.agent1.z), self.ipd)
+        objective = true_objective(self.policy.fwd(self.agent1.z), self.policy.fwd(self.agent2.z).detach(), self.ipd)\
+            + true_objective(self.policy.fwd(self.agent2.z), self.policy.fwd(self.agent1.z).detach(), self.ipd)
+        # TODO: See what this retain_graph does. Some multiprocessing stuff.
+        objective.backward(retain_graph=True)
+        self.policy_optimizer.step()
+
+        # grad_norm = self.policy.linear1.weight.grad.norm()+ self.policy.linear2.weight.grad.norm()
+        # self.writer.add_scalar('Policy/Grad_Norms', grad_norm, step)
+
         return objective
     
     def policy_update_pg(self):
@@ -357,7 +398,10 @@ class Polen():
 
         # update self z
         objective = memory1.dice_objective(dice_both=self.args.dice_both) +  memory2.dice_objective(dice_both=self.args.dice_both)
-        self.policy.policy_update(objective)
+        # self.policy.policy_update(objective)
+        self.policy_optimizer.zero_grad()
+        objective.backward(retain_graph=True)
+        self.policy_optimizer.step()
         # # update self value:
         self.agent1.value_update(memory1.value_loss())
         self.agent2.value_update(memory2.value_loss())
@@ -365,7 +409,7 @@ class Polen():
 
     def lola_update_exact(self):
         """
-        Do Lola Updates
+        Do Lola Updates using true value function
         """
         # copy other's parameters:
         z1_ = self.agent1.z.clone().detach().requires_grad_(True)
@@ -373,15 +417,15 @@ class Polen():
 
         for k in range(self.args.lookaheads):
             # estimate other's gradients from in_lookahead:
-            grad2 = self.agent1.in_lookahead_exact(self.policy.theta, z2_)
-            grad1 = self.agent2.in_lookahead_exact(self.policy.theta, z1_)
+            grad2 = self.agent1.in_lookahead_exact(self.policy, z2_)
+            grad1 = self.agent2.in_lookahead_exact(self.policy, z1_)
             # update other's theta
             z2_ = z2_ - self.args.lr_in * grad2
             z1_ = z1_ - self.args.lr_in * grad1
 
         # update own parameters from out_lookahead:
-        self.agent1.out_lookahead_exact(self.policy.theta, z2_)
-        self.agent2.out_lookahead_exact(self.policy.theta, z1_)
+        self.agent1.out_lookahead_exact(self.policy, z2_)
+        self.agent2.out_lookahead_exact(self.policy, z1_)
 
     def lola_update_dice(self):
         """
@@ -445,7 +489,8 @@ class Polen():
         return hist1, hist2, score1.mean(), score2.mean()
 
     def rollout_binning_batch(self, nsteps, z1s, z2s):
-        """Compute the Value Targets by sampling in the environment
+        """Compute the Value Targets by sampling in the environment using 
+        Steerable policy conditioned on strategy vectors.
 
         Args:
             nsteps (int): No of time-steps in the environment
@@ -481,14 +526,14 @@ if __name__=="__main__":
     polen = Polen(args)
     scores, p0, p1, p2 = polen.train()
     # Debugging
-    print('tft vs tft', polen.pen(torch.tensor([[-20.0, 20.0, -20.0, 20.0, -20.0]]), torch.tensor([[-20.0, 20.0, -20.0, 20.0, -20.0]])))
-    print('tft vs DD',  polen.pen(torch.tensor([[-20.0, 20.0, -20.0, 20.0, -20.0]]), torch.tensor([[20.0, 20.0,20.0, 20.0, 20.0]])))
-    print('DD vs CC', polen.pen(torch.tensor([[20.0, 20.0, 20.0, 20.0, 20.0]]), torch.tensor([[-20.0, -20.0, -20.0, -20.0, -20.0]])))
-    print('DD vs tft', polen.pen(torch.tensor([[20.0, 20.0, 20.0, 20.0, 20.0]]), torch.tensor([[-20.0, 20.0, -20.0, 20.0, -20.0]])))
-    print('DD vs rnd', polen.pen(torch.tensor([[20.0, 20.0, 20.0, 20.0, 20.0]]), torch.tensor([[-20.0, -20.0, 20.0, 20.0, 20.0]])))
+    # print('tft vs tft', polen.pen(torch.tensor([[-20.0, 20.0, -20.0, 20.0, -20.0]]), torch.tensor([[-20.0, 20.0, -20.0, 20.0, -20.0]])))
+    # print('tft vs DD',  polen.pen(torch.tensor([[-20.0, 20.0, -20.0, 20.0, -20.0]]), torch.tensor([[20.0, 20.0,20.0, 20.0, 20.0]])))
+    # print('DD vs CC', polen.pen(torch.tensor([[20.0, 20.0, 20.0, 20.0, 20.0]]), torch.tensor([[-20.0, -20.0, -20.0, -20.0, -20.0]])))
+    # print('DD vs tft', polen.pen(torch.tensor([[20.0, 20.0, 20.0, 20.0, 20.0]]), torch.tensor([[-20.0, 20.0, -20.0, 20.0, -20.0]])))
+    # print('DD vs rnd', polen.pen(torch.tensor([[20.0, 20.0, 20.0, 20.0, 20.0]]), torch.tensor([[-20.0, -20.0, 20.0, 20.0, 20.0]])))
     if not args.no_plot:
         plot(scores, args.lookaheads, polen.args.logdir)
-        plot_bar(p0, p1, p2, polen.args.logdir)
+        plot_scatter(p0, p1, p2, polen.args.logdir)
     polen.writer.close()
     print("--- Execution Finished in %s seconds ---" % (time.time() - start_time))
 
